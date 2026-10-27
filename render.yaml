@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: eeg-asd-results
+    runtime: static
+    buildCommand: echo Static dashboard ready
+    staticPublishPath: .
+    headers:
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin
