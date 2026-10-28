@@ -1,7 +1,7 @@
 """Real sequential nested refitting from cached EEG features. No saved prediction lookup."""
 import os
 for key in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS'):os.environ[key]='1'
-import json,time,threading
+import json,time,threading,secrets
 from pathlib import Path
 from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
 from urllib.parse import urlsplit
@@ -9,6 +9,8 @@ import numpy as np
 from pipeline import tune_predict,tune_tree,simplex_weights,StratifiedKFold
 ROOT=Path(__file__).resolve().parent
 LOCK=threading.Lock()
+JOBS={}
+JOBS_LOCK=threading.Lock()
 def run(number,emit):
     started=time.monotonic();emit({'stage':'load','message':'Loading cached subject-level EEG features. Raw preprocessing was completed earlier.'})
     with np.load(ROOT/'features.npz') as z:
@@ -35,27 +37,43 @@ def run(number,emit):
     result=dict(stage='result',message='Live nested model fitting completed.',participant=number,score=score,prediction=prediction,recorded_label=int(y[test[0]]),correct=prediction==int(y[test[0]]),seconds=round(time.monotonic()-started,2),models=[dict(name=n,score=scores[j],weight=float(weights[j]),contribution=float(scores[j]*weights[j]),chosen=settings[j]) for j,n in enumerate(names)],threshold=.5)
     emit(result);return result
 class Handler(BaseHTTPRequestHandler):
+    def reply(self,code,data,kind='application/json'):
+        body=data if isinstance(data,bytes) else json.dumps(data).encode()
+        self.send_response(code);self.send_header('Content-Type',kind);self.send_header('Content-Length',str(len(body)));self.send_header('Cache-Control','no-store');self.end_headers()
+        if self.command!='HEAD':self.wfile.write(body)
+    def do_HEAD(self):self.do_GET()
     def do_GET(self):
         path=urlsplit(self.path).path
-        if path=='/health':body=b'{"status":"ok"}';kind='application/json'
-        elif path=='/':body=(ROOT/'live.html').read_bytes();kind='text/html; charset=utf-8'
-        else:self.send_error(404);return
-        self.send_response(200);self.send_header('Content-Type',kind);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+        if path=='/health':self.reply(200,{'status':'ok'})
+        elif path=='/':self.reply(200,(ROOT/'live.html').read_bytes(),'text/html; charset=utf-8')
+        elif path.startswith('/api/jobs/'):
+            with JOBS_LOCK:
+                job=JOBS.get(path.rsplit('/',1)[1]);data=None if job is None else dict(events=list(job['events']),done=job['done'])
+            self.reply(404 if data is None else 200,data or {'error':'Run expired or server restarted. Start a new run.'})
+        else:self.reply(404,{'error':'Not found'})
     def do_POST(self):
         path=urlsplit(self.path).path
         try:
             if not path.startswith('/api/run/'):raise ValueError()
             number=int(path.rsplit('/',1)[1]);assert 1<=number<=56
-        except (ValueError,AssertionError):self.send_error(400);return
-        if not LOCK.acquire(blocking=False):self.send_error(409,'Another participant is running. Try again after it finishes.');return
-        try:
-            self.send_response(200);self.send_header('Content-Type','application/x-ndjson');self.send_header('Cache-Control','no-cache');self.send_header('X-Accel-Buffering','no');self.end_headers()
+        except (ValueError,AssertionError):self.reply(400,{'error':'Invalid participant'});return
+        if not LOCK.acquire(blocking=False):self.reply(409,{'error':'Another participant is running.'});return
+        token=secrets.token_urlsafe(24)
+        with JOBS_LOCK:
+            for key in list(JOBS):
+                if JOBS[key]['done'] and time.monotonic()-JOBS[key]['created']>3600:del JOBS[key]
+            JOBS[token]={'events':[],'done':False,'created':time.monotonic()}
+        def work():
             def emit(item):
-                self.wfile.write((json.dumps(item)+'\n').encode());self.wfile.flush();print(json.dumps(item),flush=True)
+                with JOBS_LOCK:JOBS[token]['events'].append(item)
+                print(json.dumps(item),flush=True)
             try:run(number,emit)
-            except (BrokenPipeError,ConnectionResetError):return
             except Exception as e:emit({'stage':'error','message':str(e)})
-        finally:LOCK.release()
+            finally:
+                with JOBS_LOCK:JOBS[token]['done']=True
+                LOCK.release()
+        threading.Thread(target=work,daemon=True).start()
+        self.reply(202,{'job':token})
 if __name__=='__main__':
     port=int(os.getenv('PORT','8002'));print(f'Live demo on port {port}',flush=True)
     ThreadingHTTPServer((os.getenv('HOST','127.0.0.1'),port),Handler).serve_forever()

@@ -1,5 +1,9 @@
 # Live EEG participant demo
 
+Public demo: https://eeg-asd-live-pipeline.onrender.com/
+
+Render free hosting can sleep when idle; open the link before the review to allow startup.
+
 Choose a participant and click Run live pipeline. The backend streams actual completed stages; it does not replay saved predictions.
 
 ## Run locally
